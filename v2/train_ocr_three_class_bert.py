@@ -1,8 +1,10 @@
 """
 Fine-tune a BERT sequence classifier on pre-extracted text: Prescription / Report / Others.
 
-Expects CSV columns: text, label (0–2). Install e.g.:
-  pip install transformers torch pandas scikit-learn tqdm matplotlib seaborn
+Loads V4.0_full.parquet from the current working directory (run from repo root).
+Stratified split: test holdout (test_fraction), then train/val from the remainder.
+Columns: text, label (0–2); optional filename for evaluation plots.
+Install e.g.: pip install transformers torch pandas pyarrow scikit-learn tqdm matplotlib seaborn
 """
 
 from __future__ import annotations
@@ -22,19 +24,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    BertForSequenceClassification,
-    BertTokenizer,
-)
+from transformers import BertForSequenceClassification, BertTokenizer
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    train_csv: str = "V4.0_TRAIN_FINAL_CLEANED.csv"
-    test_csv: str = "V4.0_TEST_FINAL_CLEANED.csv"
-    model_name: str = "bert-mini"
+    model_name: str = "prajjwal1/bert-mini"
     local_model_dir: str = "./bert-mini"
     best_model_dir: str = "best_model_3class"
     archive_zip_basename: str = "Model_7"
@@ -48,6 +43,7 @@ class TrainConfig:
     val_margin_threshold: float = 0.3
     inference_confidence_threshold: float = 0.7
     inference_margin_threshold: float = 0.3
+    test_fraction: float = 0.2
     val_fraction: float = 0.2
     random_state: int = 42
 
@@ -90,24 +86,38 @@ class TextClassificationDataset(Dataset):
         return item
 
 
-def load_train_val_split(config: TrainConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    full_train = pd.read_csv(config.train_csv)
-    full_train = full_train.dropna(subset=["text", "label"])
-    train_frame, val_frame = train_test_split(
-        full_train,
-        test_size=config.val_fraction,
-        stratify=full_train["label"],
+def load_train_val_test_from_v4_full_parquet(
+    config: TrainConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    full = pd.read_parquet("V4.0_full.parquet")
+    full = full.dropna(subset=["text", "label"])
+    train_pool, test_frame = train_test_split(
+        full,
+        test_size=config.test_fraction,
+        stratify=full["label"],
         random_state=config.random_state,
     )
-    print(f"Train size: {len(train_frame)} | Validation size: {len(val_frame)}")
+    train_frame, val_frame = train_test_split(
+        train_pool,
+        test_size=config.val_fraction,
+        stratify=train_pool["label"],
+        random_state=config.random_state,
+    )
+    print(
+        f"V4.0_full.parquet | Train: {len(train_frame)} | Val: {len(val_frame)} | Test: {len(test_frame)}"
+    )
     print(train_frame["label"].value_counts())
-    return train_frame, val_frame
+    return train_frame, val_frame, test_frame
 
 
 def build_tokenizer_and_model(config: TrainConfig):
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        config.local_model_dir,
+    tokenizer = BertTokenizer.from_pretrained(config.model_name)
+    local_ok = os.path.isdir(config.local_model_dir) and bool(os.listdir(config.local_model_dir))
+    model_source = config.local_model_dir if local_ok else config.model_name
+    if not local_ok:
+        print(f"Local model dir missing or empty; loading weights from Hub: {model_source}")
+    model = BertForSequenceClassification.from_pretrained(
+        model_source,
         num_labels=config.num_labels,
         ignore_mismatched_sizes=True,
     )
@@ -433,7 +443,7 @@ def run_evaluation_and_plots(
         )
     )
 
-    print_directory_size_megabytes("best_model")
+    print_directory_size_megabytes(config.best_model_dir)
     parameter_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffer_bytes = sum(b.nelement() * b.element_size() for b in model.buffers())
     model_size_mb = (parameter_bytes + buffer_bytes) / 1024**2
@@ -445,7 +455,8 @@ def main() -> None:
     config = TrainConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_frame, val_frame = load_train_val_split(config)
+    train_frame, val_frame, test_frame = load_train_val_test_from_v4_full_parquet(config)
+
     tokenizer, model = build_tokenizer_and_model(config)
     train_loader, val_loader = build_dataloaders(train_frame, val_frame, tokenizer, config)
     model.to(device)
@@ -456,11 +467,6 @@ def main() -> None:
     if model is None or tokenizer is None:
         return
 
-    if not os.path.exists(config.test_csv):
-        print(f"Error: {config.test_csv} not found.")
-        return
-
-    test_frame = pd.read_csv(config.test_csv)
     print(f"Loaded {len(test_frame)} testing rows.")
     model.to(device)
     run_evaluation_and_plots(model, tokenizer, test_frame, device, config)
