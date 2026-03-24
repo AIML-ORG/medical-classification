@@ -4,7 +4,7 @@ Fine-tune a BERT sequence classifier on pre-extracted text: Prescription / Repor
 Loads V4.0_full.parquet from the current working directory (run from repo root).
 Stratified split: test holdout (test_fraction), then train/val from the remainder.
 Columns: text, label (0–2); optional filename for evaluation plots.
-Install e.g.: pip install transformers torch pandas pyarrow scikit-learn tqdm matplotlib seaborn
+Install e.g.: pip install transformers torch torchao pandas pyarrow scikit-learn tqdm matplotlib seaborn
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset
+from torchao.quantization import quantize_
+from torchao.quantization.qat import IntxFakeQuantizeConfig, QATConfig
 from tqdm import tqdm
 from transformers import BertForSequenceClassification, BertTokenizer
 
@@ -249,7 +251,7 @@ def run_training(
 
     grad_mean = model.classifier.weight.grad
     if grad_mean is not None:
-        print(grad_mean.abs().mean())
+        print(f"Classifier weight |grad| mean: {grad_mean.abs().mean().item():.6f}")
 
 
 def load_trained_model(model_dir: str, device: torch.device):
@@ -460,6 +462,15 @@ def main() -> None:
     tokenizer, model = build_tokenizer_and_model(config)
     train_loader, val_loader = build_dataloaders(train_frame, val_frame, tokenizer, config)
     model.to(device)
+    model.train()
+    quantize_(
+        model,
+        QATConfig(
+            activation_config=IntxFakeQuantizeConfig(torch.int8, "per_token", is_symmetric=False, is_dynamic=True),
+            weight_config=IntxFakeQuantizeConfig(torch.int8, "per_channel", is_symmetric=True, is_dynamic=False),
+            step="prepare",
+        ),
+    )
 
     run_training(model, tokenizer, train_frame, train_loader, val_loader, device, config)
 
