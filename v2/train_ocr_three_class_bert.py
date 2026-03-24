@@ -26,7 +26,38 @@ from torch.utils.data import DataLoader, Dataset
 from torchao.quantization import quantize_
 from torchao.quantization.qat import IntxFakeQuantizeConfig, QATConfig
 from tqdm import tqdm
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
+
+INT8_DYNAMIC_WEIGHTS_FILENAME = "model_int8_dynamic.pt"
+
+
+def _set_torch_quantized_engine_for_cpu() -> None:
+    supported = getattr(torch.backends.quantized, "supported_engines", [])
+    if "qnnpack" in supported:
+        torch.backends.quantized.engine = "qnnpack"
+    elif "fbgemm" in supported:
+        torch.backends.quantized.engine = "fbgemm"
+
+
+def float_model_to_dynamic_int8_cpu(model: nn.Module) -> nn.Module:
+    _set_torch_quantized_engine_for_cpu()
+    return torch.quantization.quantize_dynamic(
+        model.cpu().eval(),
+        {nn.Linear},
+        dtype=torch.qint8,
+    )
+
+
+def qat_prepare_config() -> QATConfig:
+    return QATConfig(
+        activation_config=IntxFakeQuantizeConfig(
+            torch.int8, "per_token", is_symmetric=False, is_dynamic=True
+        ),
+        weight_config=IntxFakeQuantizeConfig(
+            torch.int8, "per_channel", is_symmetric=True, is_dynamic=False
+        ),
+        step="prepare",
+    )
 
 
 @dataclass(frozen=True)
@@ -35,7 +66,7 @@ class TrainConfig:
     local_model_dir: str = "./bert-mini"
     best_model_dir: str = "best_model_3class"
     archive_zip_basename: str = "Model_7"
-    epochs: int = 4
+    epochs: int = 1
     batch_size: int = 16
     max_len_train: int = 128
     max_len_inference: int = 512
@@ -238,6 +269,7 @@ def run_training(
     print(f"Loss function initialized with class weights on {device}")
 
     best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
     for epoch in range(config.epochs):
         train_one_epoch(model, train_loader, device, optimizer, loss_fn, epoch)
         avg_val_loss, _val_acc = validate_epoch(
@@ -245,31 +277,91 @@ def run_training(
         )
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            model.save_pretrained(config.best_model_dir)
-            tokenizer.save_pretrained(config.best_model_dir)
-            print("Best model saved")
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            print(f"Best val loss {best_val_loss:.6f} (checkpoint in memory; disk save after convert only)")
+
+    if best_state is None:
+        raise RuntimeError("No best checkpoint tracked; training loop produced no improvement state.")
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+    qat_val_loss, qat_val_acc = validate_epoch(
+        model, val_loader, device, loss_fn, config, config.epochs
+    )
+    print(
+        f"Eval (val) | QAT fake-quant: loss={qat_val_loss:.6f} accuracy={qat_val_acc:.6f}"
+    )
+
+    quantize_(model, QATConfig(step="convert"))
+    model.to(device)
+    cnv_val_loss, cnv_val_acc = validate_epoch(
+        model, val_loader, device, loss_fn, config, config.epochs
+    )
+    print(
+        f"Eval (val) | post-convert (saved): loss={cnv_val_loss:.6f} accuracy={cnv_val_acc:.6f}"
+    )
+    print(
+        f"Eval (val) | diff (convert - QAT): d_loss={cnv_val_loss - qat_val_loss:+.6f} "
+        f"d_accuracy={cnv_val_acc - qat_val_acc:+.6f}"
+    )
 
     grad_mean = model.classifier.weight.grad
     if grad_mean is not None:
         print(f"Classifier weight |grad| mean: {grad_mean.abs().mean().item():.6f}")
 
+    os.makedirs(config.best_model_dir, exist_ok=True)
+    for stale_name in ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"):
+        stale_path = os.path.join(config.best_model_dir, stale_name)
+        if os.path.isfile(stale_path):
+            os.remove(stale_path)
 
-def load_trained_model(model_dir: str, device: torch.device):
+    float_sd_bytes = sum(
+        t.numel() * t.element_size()
+        for t in model.state_dict().values()
+        if isinstance(t, torch.Tensor)
+    )
+    model_int8 = float_model_to_dynamic_int8_cpu(model)
+    int8_path = os.path.join(config.best_model_dir, INT8_DYNAMIC_WEIGHTS_FILENAME)
+    torch.save(model_int8.state_dict(), int8_path)
+    int8_sd_bytes = os.path.getsize(int8_path)
+    model.config.save_pretrained(config.best_model_dir)
+    tokenizer.save_pretrained(config.best_model_dir)
+    print(
+        f"Saved int8 dynamic-quantized Linear weights to {int8_path} "
+        f"({int8_sd_bytes / (1024 ** 2):.2f} MB on disk; "
+        f"float state ~{float_sd_bytes / (1024 ** 2):.2f} MB raw tensor bytes before packing)."
+    )
+
+
+def load_trained_model(
+    model_dir: str, device: torch.device
+) -> tuple[BertForSequenceClassification | None, BertTokenizer | None, torch.device | None]:
     if not os.path.exists(model_dir):
         print(f"ERROR: Folder not found at {model_dir}")
-        return None, None
+        return None, None, None
     print(f"Folder found. Files inside: {os.listdir(model_dir)}")
+    int8_path = os.path.join(model_dir, INT8_DYNAMIC_WEIGHTS_FILENAME)
     try:
-        print(f"Loading model onto: {device}")
         tokenizer = BertTokenizer.from_pretrained(model_dir, local_files_only=True)
+        if os.path.isfile(int8_path):
+            print(f"Loading int8 dynamic-quantized weights from {int8_path} (CPU inference).")
+            cfg = BertConfig.from_pretrained(model_dir, local_files_only=True)
+            shell = BertForSequenceClassification(cfg)
+            shell.eval()
+            model = float_model_to_dynamic_int8_cpu(shell)
+            state = torch.load(int8_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=True)
+            print("BERT int8 dynamic model and tokenizer ready for testing.")
+            return model, tokenizer, torch.device("cpu")
+        print(f"Loading model onto: {device}")
         model = BertForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
         model.to(device)
         model.eval()
         print("BERT model and tokenizer ready for testing.")
-        return model, tokenizer
+        return model, tokenizer, device
     except Exception as exc:
         print(f"Load failed: {exc}")
-        return None, None
+        return None, None, None
 
 
 def tokenize_batch_text(
@@ -463,24 +555,16 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(train_frame, val_frame, tokenizer, config)
     model.to(device)
     model.train()
-    quantize_(
-        model,
-        QATConfig(
-            activation_config=IntxFakeQuantizeConfig(torch.int8, "per_token", is_symmetric=False, is_dynamic=True),
-            weight_config=IntxFakeQuantizeConfig(torch.int8, "per_channel", is_symmetric=True, is_dynamic=False),
-            step="prepare",
-        ),
-    )
+    quantize_(model, qat_prepare_config())
 
     run_training(model, tokenizer, train_frame, train_loader, val_loader, device, config)
 
-    model, tokenizer = load_trained_model(config.best_model_dir, device)
-    if model is None or tokenizer is None:
+    model, tokenizer, infer_device = load_trained_model(config.best_model_dir, device)
+    if model is None or tokenizer is None or infer_device is None:
         return
 
     print(f"Loaded {len(test_frame)} testing rows.")
-    model.to(device)
-    run_evaluation_and_plots(model, tokenizer, test_frame, device, config)
+    run_evaluation_and_plots(model, tokenizer, test_frame, infer_device, config)
 
 
 if __name__ == "__main__":
