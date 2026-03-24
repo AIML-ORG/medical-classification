@@ -24,7 +24,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset
 from torchao.quantization import quantize_
+from torchao.quantization.quant_api import _is_linear
 from torchao.quantization.qat import IntxFakeQuantizeConfig, QATConfig
+from torchao.quantization.qat.embedding import FakeQuantizedEmbedding
+from torchao.quantization.qat.linear import FakeQuantizedLinear
 from tqdm import tqdm
 from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
 
@@ -48,15 +51,40 @@ def float_model_to_dynamic_int8_cpu(model: nn.Module) -> nn.Module:
     )
 
 
-def qat_prepare_config() -> QATConfig:
-    return QATConfig(
-        activation_config=IntxFakeQuantizeConfig(
-            torch.int8, "per_token", is_symmetric=False, is_dynamic=True
+def _is_plain_embedding(mod: nn.Module, fqn: str) -> bool:
+    return type(mod) is nn.Embedding
+
+
+def _is_linear_for_qat_prepare(mod: nn.Module, fqn: str) -> bool:
+    return _is_linear(mod, fqn)
+
+
+def _is_fake_qat_for_convert(mod: nn.Module, fqn: str) -> bool:
+    return isinstance(mod, (FakeQuantizedLinear, FakeQuantizedEmbedding))
+
+
+def apply_qat_prepare_model(model: nn.Module) -> None:
+    """Int8 QAT on all nn.Embedding (weight-only) then all nn.Linear (activation + weight)."""
+    emb_weight = IntxFakeQuantizeConfig(
+        torch.int8, "per_channel", is_symmetric=True, is_dynamic=False
+    )
+    quantize_(
+        model,
+        QATConfig(weight_config=emb_weight, step="prepare"),
+        filter_fn=_is_plain_embedding,
+    )
+    quantize_(
+        model,
+        QATConfig(
+            activation_config=IntxFakeQuantizeConfig(
+                torch.int8, "per_token", is_symmetric=False, is_dynamic=True
+            ),
+            weight_config=IntxFakeQuantizeConfig(
+                torch.int8, "per_channel", is_symmetric=True, is_dynamic=False
+            ),
+            step="prepare",
         ),
-        weight_config=IntxFakeQuantizeConfig(
-            torch.int8, "per_channel", is_symmetric=True, is_dynamic=False
-        ),
-        step="prepare",
+        filter_fn=_is_linear_for_qat_prepare,
     )
 
 
@@ -292,7 +320,7 @@ def run_training(
         f"Eval (val) | QAT fake-quant: loss={qat_val_loss:.6f} accuracy={qat_val_acc:.6f}"
     )
 
-    quantize_(model, QATConfig(step="convert"))
+    quantize_(model, QATConfig(step="convert"), filter_fn=_is_fake_qat_for_convert)
     model.to(device)
     cnv_val_loss, cnv_val_acc = validate_epoch(
         model, val_loader, device, loss_fn, config, config.epochs
@@ -329,7 +357,8 @@ def run_training(
     print(
         f"Saved int8 dynamic-quantized Linear weights to {int8_path} "
         f"({int8_sd_bytes / (1024 ** 2):.2f} MB on disk; "
-        f"float state ~{float_sd_bytes / (1024 ** 2):.2f} MB raw tensor bytes before packing)."
+        f"float ~{float_sd_bytes / (1024 ** 2):.2f} MB raw). "
+        "Embeddings remain float in this export (PyTorch dynamic quant skips Embedding)."
     )
 
 
@@ -555,7 +584,7 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(train_frame, val_frame, tokenizer, config)
     model.to(device)
     model.train()
-    quantize_(model, qat_prepare_config())
+    apply_qat_prepare_model(model)
 
     run_training(model, tokenizer, train_frame, train_loader, val_loader, device, config)
 
