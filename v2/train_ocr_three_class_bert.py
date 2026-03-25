@@ -31,7 +31,8 @@ from torchao.quantization.qat.linear import FakeQuantizedLinear
 from tqdm import tqdm
 from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
 
-INT8_DYNAMIC_WEIGHTS_FILENAME = "model_int8_dynamic.pt"
+QAT_INT8_WEIGHTS_FILENAME = "model_qat_int8.pt"
+LEGACY_DYNAMIC_INT8_WEIGHTS_FILENAME = "model_int8_dynamic.pt"
 
 
 def _set_torch_quantized_engine_for_cpu() -> None:
@@ -42,13 +43,22 @@ def _set_torch_quantized_engine_for_cpu() -> None:
         torch.backends.quantized.engine = "fbgemm"
 
 
-def float_model_to_dynamic_int8_cpu(model: nn.Module) -> nn.Module:
+def _float_model_to_dynamic_int8_cpu_legacy(model: nn.Module) -> nn.Module:
+    """PTQ dynamic int8 on Linear only; used only to load old `model_int8_dynamic.pt` checkpoints."""
     _set_torch_quantized_engine_for_cpu()
     return torch.quantization.quantize_dynamic(
         model.cpu().eval(),
         {nn.Linear},
         dtype=torch.qint8,
     )
+
+
+def build_qat_converted_bert_for_load(cfg: BertConfig) -> BertForSequenceClassification:
+    """Same module graph as after training convert (prepare then convert, no weights)."""
+    model = BertForSequenceClassification(cfg)
+    apply_qat_prepare_model(model)
+    quantize_(model, QATConfig(step="convert"), filter_fn=_is_fake_qat_for_convert)
+    return model
 
 
 def _is_plain_embedding(mod: nn.Module, fqn: str) -> bool:
@@ -343,22 +353,21 @@ def run_training(
         if os.path.isfile(stale_path):
             os.remove(stale_path)
 
-    float_sd_bytes = sum(
+    model.cpu()
+    qat_sd_bytes = sum(
         t.numel() * t.element_size()
         for t in model.state_dict().values()
         if isinstance(t, torch.Tensor)
     )
-    model_int8 = float_model_to_dynamic_int8_cpu(model)
-    int8_path = os.path.join(config.best_model_dir, INT8_DYNAMIC_WEIGHTS_FILENAME)
-    torch.save(model_int8.state_dict(), int8_path)
-    int8_sd_bytes = os.path.getsize(int8_path)
+    qat_path = os.path.join(config.best_model_dir, QAT_INT8_WEIGHTS_FILENAME)
+    torch.save(model.state_dict(), qat_path)
+    qat_file_bytes = os.path.getsize(qat_path)
     model.config.save_pretrained(config.best_model_dir)
     tokenizer.save_pretrained(config.best_model_dir)
     print(
-        f"Saved int8 dynamic-quantized Linear weights to {int8_path} "
-        f"({int8_sd_bytes / (1024 ** 2):.2f} MB on disk; "
-        f"float ~{float_sd_bytes / (1024 ** 2):.2f} MB raw). "
-        "Embeddings remain float in this export (PyTorch dynamic quant skips Embedding)."
+        f"Saved torchao QAT-converted int8 state_dict (Embedding + Linear) to {qat_path} "
+        f"({qat_file_bytes / (1024 ** 2):.2f} MB on disk; "
+        f"~{qat_sd_bytes / (1024 ** 2):.2f} MB tensor footprint in memory)."
     )
 
 
@@ -369,18 +378,31 @@ def load_trained_model(
         print(f"ERROR: Folder not found at {model_dir}")
         return None, None, None
     print(f"Folder found. Files inside: {os.listdir(model_dir)}")
-    int8_path = os.path.join(model_dir, INT8_DYNAMIC_WEIGHTS_FILENAME)
+    qat_path = os.path.join(model_dir, QAT_INT8_WEIGHTS_FILENAME)
+    legacy_path = os.path.join(model_dir, LEGACY_DYNAMIC_INT8_WEIGHTS_FILENAME)
     try:
         tokenizer = BertTokenizer.from_pretrained(model_dir, local_files_only=True)
-        if os.path.isfile(int8_path):
-            print(f"Loading int8 dynamic-quantized weights from {int8_path} (CPU inference).")
+        if os.path.isfile(qat_path):
+            print(f"Loading torchao QAT-converted int8 weights from {qat_path} (CPU inference).")
+            cfg = BertConfig.from_pretrained(model_dir, local_files_only=True)
+            _set_torch_quantized_engine_for_cpu()
+            model = build_qat_converted_bert_for_load(cfg)
+            state = torch.load(qat_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=True)
+            model.eval()
+            print("BERT QAT int8 model and tokenizer ready for testing.")
+            return model, tokenizer, torch.device("cpu")
+        if os.path.isfile(legacy_path):
+            print(
+                f"Loading legacy dynamic-int8 Linear-only weights from {legacy_path} (CPU inference)."
+            )
             cfg = BertConfig.from_pretrained(model_dir, local_files_only=True)
             shell = BertForSequenceClassification(cfg)
             shell.eval()
-            model = float_model_to_dynamic_int8_cpu(shell)
-            state = torch.load(int8_path, map_location="cpu", weights_only=True)
+            model = _float_model_to_dynamic_int8_cpu_legacy(shell)
+            state = torch.load(legacy_path, map_location="cpu", weights_only=True)
             model.load_state_dict(state, strict=True)
-            print("BERT int8 dynamic model and tokenizer ready for testing.")
+            print("BERT legacy int8 dynamic model and tokenizer ready for testing.")
             return model, tokenizer, torch.device("cpu")
         print(f"Loading model onto: {device}")
         model = BertForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
