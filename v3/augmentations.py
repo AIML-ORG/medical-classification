@@ -5,18 +5,28 @@ from tqdm import tqdm
 
 # 1. Define your "Medical Document" Pipeline (from our previous discussion)
 transform = A.Compose([
-    # 1. SUBTLE GEOMETRY (No more heavy crumbling)
+    # 0. FLIPS & RIGHT-ANGLE ROTATION (90/180/270/360°; 360° = identity, sampled as 0°)
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=1.0),
+
+    # 1. GEOMETRY — skew / keystone = Perspective (trapezoid from camera angle).
+    #    ElasticTransform = wavy paper, not trapezoid skew.
     A.OneOf([
-        # Perspective is the most important for mobile photos
-        A.Perspective(scale=(0.02, 0.05), p=1), 
-        # Subtle paper waves (ElasticTransform is much faster than PiecewiseAffine)
-        A.ElasticTransform(alpha=8, sigma=40, approximate=True, p=1),
-    ], p=0.4),
+        A.Perspective(
+            scale=(0.06, 0.14),
+            fit_output=True,
+            border_mode=0,
+            fill=(255, 255, 255),
+            p=1,
+        ),
+        A.ElasticTransform(alpha=12, sigma=40, approximate=True, p=1),
+    ], p=0.85),
 
     # 2. PRINTING & SCANNING ARTIFACTS (The "Source" Simulation)
     A.OneOf([
         # Halftone: Simulates the dot-pattern of a printed or photocopied page
-        A.Halftone(p=1), 
+        A.Halftone(dot_size_range=(2, 4), blend_range=(0.0, 0.3), p=1),
         # Dithering: Simulates low-quality digital scans or faxes
         A.Dithering(p=1),
         # FilmGrain: Adds "texture" to a perfectly flat digital PDF
@@ -32,10 +42,10 @@ transform = A.Compose([
 
     # 4. TEXT LEGIBILITY (Blur vs Sharpen)
     A.OneOf([
-        A.Sharpen(alpha=(0.2, 0.5), p=1),      # Simulates high-quality scans
-        A.MotionBlur(blur_limit=3, p=1),       # Simulates shaky phone camera
-        A.GaussianBlur(blur_limit=3, p=1),     # Simulates out-of-focus text
+        A.Sharpen(alpha=(0.2, 0.5), p=1),
+        A.GaussianBlur(blur_limit=(3, 5), p=1),
     ], p=0.3),
+    A.MotionBlur(blur_limit=(2, 4), allow_shifted=True, p=0.45),
 
     # 5. NOISE & COMPRESSION
     A.OneOf([
