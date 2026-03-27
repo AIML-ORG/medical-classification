@@ -4,8 +4,12 @@ Minimal inference class for MobileNetV4 3-class classification.
 Usage:
     python v3/infer.py <path> [--checkpoint v3/outputs/v1.pt]
 
-    <path> can be a single image file or a folder containing images.
-    Results are saved to results.txt in the same directory as the images.
+    <path> can be:
+    - Single image file
+    - Folder with images (results.txt saved in that folder)
+    - Root folder (recursively finds all folders with images, saves results.txt in each)
+
+    Results are saved to results.txt in each folder containing images.
 """
 from __future__ import annotations
 
@@ -194,6 +198,35 @@ class ImageClassifier:
         print(f"\nResults saved to: {output_file}")
 
 
+def find_images_in_folder(folder: Path) -> list[Path]:
+    """Find all image files directly in a folder (non-recursive)."""
+    images = set()
+    for ext in ImageClassifier.IMAGE_EXTENSIONS:
+        for p in folder.glob(f"*{ext}"):
+            images.add(p)
+        for p in folder.glob(f"*{ext.upper()}"):
+            images.add(p)
+    return sorted(images)
+
+
+def find_folders_with_images(root: Path) -> list[Path]:
+    """
+    Recursively find all folders containing image files.
+
+    Returns list of folder paths that contain at least one image.
+    """
+    folders_with_images = []
+    root = Path(root)
+
+    for folder in root.rglob("*"):
+        if folder.is_dir():
+            images = find_images_in_folder(folder)
+            if images:
+                folders_with_images.append(folder)
+
+    return sorted(folders_with_images)
+
+
 def find_images(path: Path) -> list[Path]:
     """Find all image files in a path (file or directory)."""
     path = Path(path)
@@ -206,13 +239,7 @@ def find_images(path: Path) -> list[Path]:
             return []
 
     if path.is_dir():
-        images = set()
-        for ext in ImageClassifier.IMAGE_EXTENSIONS:
-            for p in path.glob(f"*{ext}"):
-                images.add(p)
-            for p in path.glob(f"*{ext.upper()}"):
-                images.add(p)
-        return sorted(images)
+        return find_images_in_folder(path)
 
     print(f"Path not found: {path}")
     return []
@@ -246,18 +273,48 @@ def main():
         choices=["auto", "cuda", "cpu"],
         help="Device to use for inference",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recursively find all folders with images and save results.txt in each",
+    )
     args = parser.parse_args()
 
-    # Find images
+    # Initialize classifier
+    classifier = ImageClassifier(args.checkpoint, device=args.device)
+
+    # Handle recursive mode
+    if args.recursive and args.path.is_dir():
+        folders = find_folders_with_images(args.path)
+        if not folders:
+            print("No folders with images found.")
+            sys.exit(1)
+
+        print(f"Found {len(folders)} folder(s) with images\n")
+
+        total_images = 0
+        for folder in folders:
+            images = find_images_in_folder(folder)
+            if not images:
+                continue
+
+            print(f"\nProcessing: {folder} ({len(images)} images)")
+            output_file = folder / "results.txt"
+            results = classifier.predict_batch(images, output_file=output_file)
+            total_images += len(images)
+
+        print(f"\n{'='*50}")
+        print(f"Total: {total_images} images in {len(folders)} folders")
+        print("=" * 50)
+        return
+
+    # Single file or single folder mode
     images = find_images(args.path)
     if not images:
         print("No images found to process.")
         sys.exit(1)
 
     print(f"Found {len(images)} image(s) to process\n")
-
-    # Initialize classifier
-    classifier = ImageClassifier(args.checkpoint, device=args.device)
 
     # Run inference
     results = classifier.predict_batch(images, output_file=args.output)
