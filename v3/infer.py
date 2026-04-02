@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 import timm
 from timm.data import resolve_model_data_config, create_transform
+from safetensors.torch import load_file
 
 
 class ImageClassifier:
@@ -37,7 +38,7 @@ class ImageClassifier:
         Initialize the classifier.
 
         Args:
-            checkpoint_path: Path to the .pt checkpoint file
+            checkpoint_path: Path to checkpoint file (.safetensors or .pt)
             device: Device to use ("auto", "cuda", "cpu")
         """
         self.checkpoint_path = Path(checkpoint_path)
@@ -50,16 +51,34 @@ class ImageClassifier:
         else:
             self.device = torch.device(device)
 
-        # Load checkpoint
-        checkpoint = torch.load(self.checkpoint_path, weights_only=False)
-
         # Create model
         self.model = timm.create_model(
             "mobilenetv4_conv_small.e3600_r256_in1k",
             pretrained=False,
             num_classes=3
         )
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load weights based on file format
+        if self.checkpoint_path.suffix == ".safetensors":
+            # Load from safetensors
+            state_dict = load_file(self.checkpoint_path)
+            self.model.load_state_dict(state_dict)
+
+            # Try to load metadata
+            metadata_path = self.checkpoint_path.with_suffix(".json")
+            if metadata_path.exists():
+                import json
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                self.class_names = metadata.get("class_names", self.CLASS_NAMES)
+            else:
+                self.class_names = self.CLASS_NAMES
+        else:
+            # Load from PyTorch checkpoint
+            checkpoint = torch.load(self.checkpoint_path, weights_only=False)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.class_names = checkpoint.get("class_names", self.CLASS_NAMES)
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -121,10 +140,10 @@ class ImageClassifier:
 
         # Build result
         probabilities = {
-            name: float(probs[i]) for i, name in enumerate(self.CLASS_NAMES)
+            name: float(probs[i]) for i, name in enumerate(self.class_names)
         }
         predicted_idx = int(probs.argmax())
-        predicted_class = self.CLASS_NAMES[predicted_idx]
+        predicted_class = self.class_names[predicted_idx]
 
         return {
             "probabilities": probabilities,

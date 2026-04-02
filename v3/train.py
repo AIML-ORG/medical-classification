@@ -339,6 +339,9 @@ def compute_per_class_metrics(
     return metrics
 
 
+from safetensors.torch import save_file
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -347,7 +350,25 @@ def save_checkpoint(
     output_path: Path,
     class_names: list[str],
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint in safetensors format."""
+    # Save model weights in safetensors format
+    weights_path = output_path.with_suffix(".safetensors")
+    save_file(model.state_dict(), weights_path)
+    print(f"Model weights saved to {weights_path}")
+
+    # Save metadata in JSON
+    metadata = {
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "class_names": class_names,
+        "label_map": {name: i for i, name in enumerate(class_names)},
+    }
+    metadata_path = output_path.with_suffix(".json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to {metadata_path}")
+
+    # Also save full checkpoint for resuming training
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -357,7 +378,7 @@ def save_checkpoint(
         "label_map": {name: i for i, name in enumerate(class_names)},
     }
     torch.save(checkpoint, output_path)
-    print(f"Checkpoint saved to {output_path}")
+    print(f"Full checkpoint saved to {output_path}")
 
 
 def main():
